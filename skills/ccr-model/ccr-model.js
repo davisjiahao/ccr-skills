@@ -687,7 +687,7 @@ function queryModels(query) {
   console.log('');
 }
 
-function setModel(query) {
+function setModel(query, args) {
   const models = getAllModels();
   if (models.length === 0) {
     log('No models available.', 'error');
@@ -724,12 +724,50 @@ function setModel(query) {
     console.log('');
   }
 
+  // Convert provider/model format to provider,model format (CCR uses comma)
+  const ccrFormat = fullModelName.replace('/', ',');
+
+  // Parse options
+  const isSession = args.includes('--session') || args.includes('-s');
+  const isTemp = args.includes('--temp') || args.includes('-t');
+
+  if (isSession || isTemp) {
+    // Session-level: set via environment variable (won't persist)
+    console.log(`✅ Setting session model: ${fullModelName}`);
+    console.log(`   Format: ${ccrFormat}`);
+    console.log(`\nℹ️  Session model active! Will reset when Claude Code restarts.`);
+    console.log(`   To use in current session, set in settings.json or restart Claude Code.`);
+
+    // Also update CCR config as fallback
+    const config = getCCRConfig();
+    config.Router = config.Router || {};
+    config.Router.default = ccrFormat;
+    saveCCRConfig(config);
+
+    const settings = getClaudeSettings();
+    settings.model = fullModelName;
+    saveClaudeSettings(settings);
+
+    console.log(`\n✅ Model updated!`);
+    return;
+  }
+
   console.log(`✅ Setting model to: ${fullModelName}`);
 
-  // Update CCR config router.default
+  // Update CCR config router.default (preserve other router configs)
   const config = getCCRConfig();
   config.Router = config.Router || {};
-  config.Router.default = fullModelName;
+  config.Router.default = ccrFormat;
+
+  // Preserve existing role-specific configs if they exist
+  const existingRouter = getCCRConfig()?.Router || {};
+  if (existingRouter.think) config.Router.think = existingRouter.think;
+  if (existingRouter.longContext) config.Router.longContext = existingRouter.longContext;
+  if (existingRouter.longContextThreshold) config.Router.longContextThreshold = existingRouter.longContextThreshold;
+  if (existingRouter.webSearch) config.Router.webSearch = existingRouter.webSearch;
+  if (existingRouter.background) config.Router.background = existingRouter.background;
+  if (existingRouter.image) config.Router.image = existingRouter.image;
+
   saveCCRConfig(config);
 
   // Also update Claude settings
@@ -738,9 +776,9 @@ function setModel(query) {
   saveClaudeSettings(settings);
 
   console.log(`\n✅ Model updated successfully!`);
-  console.log(`   Router default: ${fullModelName}`);
+  console.log(`   Router default: ${ccrFormat}`);
   console.log(`   Claude settings model: ${fullModelName}`);
-  console.log(`\nℹ️  You may need to restart Claude Code to use the new model.`);
+  console.log(`\nℹ️  CCR 立即生效，无需重启 daemon`);
 }
 
 function importProviders() {
@@ -957,7 +995,7 @@ function main() {
         console.error('Please provide a model to set');
         process.exit(1);
       }
-      setModel(modelQuery);
+      setModel(modelQuery, args);
       break;
 
     case 'import':
@@ -981,6 +1019,7 @@ Commands:
   list                List all available models
   query <text>        Search models by natural language
   set <model>         Set the default model (supports fuzzy matching)
+  set <model> --session  Set model for current session only
   import              Import providers from cc-switch
   status              Show CCR installation and configuration status
   help                Show this help message
@@ -991,6 +1030,7 @@ Examples:
   ccr-model set glm-5
   ccr-model set M2.5          # Matches MiniMax-M2.5
   ccr-model set min2.5        # Also matches MiniMax-M2.5
+  ccr-model set opus --session  # Session-only (resets on restart)
   ccr-model import            # Import from cc-switch
   ccr-model status            # Check CCR status
       `);
