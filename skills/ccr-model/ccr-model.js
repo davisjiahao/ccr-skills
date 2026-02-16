@@ -730,8 +730,7 @@ function setModel(query, args) {
   // Convert provider/model format to provider,model format (CCR uses comma)
   const ccrFormat = fullModelName.replace('/', ',');
 
-  // Parse options
-  const isSession = args.includes('--session') || args.includes('-s');
+  // Parse role option
   const roleArg = args.find(a => a.startsWith('--role=') || a.startsWith('-r='));
   const role = roleArg ? roleArg.split('=')[1] : null;
 
@@ -740,43 +739,7 @@ function setModel(query, args) {
 
   // Get existing config
   const config = getCCRConfig();
-  const existingRouter = config?.Router || {};
 
-  if (isSession) {
-    // True session-level: backup config, set model, will restore on next session
-    console.log(`✅ Setting session model: ${fullModelName}`);
-
-    // Backup current router config to a temp file
-    const backupPath = CCR_CONFIG_PATH + '.backup';
-    fs.writeFileSync(backupPath, JSON.stringify(existingRouter, null, 2));
-
-    // Set the model
-    config.Router = config.Router || {};
-
-    if (role && validRoles.includes(role)) {
-      // Set specific role
-      config.Router[role] = ccrFormat;
-      console.log(`   Role: ${role} = ${ccrFormat}`);
-    } else if (!role) {
-      // Set all roles
-      config.Router.default = ccrFormat;
-      config.Router.think = ccrFormat;
-      config.Router.background = ccrFormat;
-      config.Router.longContext = ccrFormat;
-      config.Router.webSearch = ccrFormat;
-      config.Router.image = ccrFormat;
-      console.log(`   All roles set to: ${ccrFormat}`);
-    }
-
-    saveCCRConfig(config);
-
-    console.log(`\nℹ️  Session model active!`);
-    console.log(`   Config backed up to: ${backupPath}`);
-    console.log(`   Will restore when you run: ccr-model restore`);
-    return;
-  }
-
-  // Permanent change
   console.log(`✅ Setting model to: ${fullModelName}`);
 
   config.Router = config.Router || {};
@@ -806,32 +769,6 @@ function setModel(query, args) {
 
   console.log(`\n✅ Model updated successfully!`);
   console.log(`\nℹ️  CCR 立即生效，无需重启 daemon`);
-}
-
-function restoreFromBackup() {
-  const backupPath = CCR_CONFIG_PATH + '.backup';
-
-  if (!fs.existsSync(backupPath)) {
-    console.log('❌ No backup found. Run "ccr-model set --session" first to create a backup.');
-    process.exit(1);
-  }
-
-  try {
-    const backup = JSON.parse(fs.readFileSync(backupPath, 'utf-8'));
-    const config = getCCRConfig();
-
-    config.Router = backup;
-    saveCCRConfig(config);
-
-    // Delete backup file
-    fs.unlinkSync(backupPath);
-
-    console.log('✅ Router config restored from backup!');
-    console.log(`   Backup file deleted.`);
-  } catch (e) {
-    console.error('❌ Failed to restore:', e.message);
-    process.exit(1);
-  }
 }
 
 function importProviders() {
@@ -1055,10 +992,6 @@ function main() {
       importProviders();
       break;
 
-    case 'restore':
-      restoreFromBackup();
-      break;
-
     case 'status':
       showStatus();
       showModelInfo = false;
@@ -1077,8 +1010,6 @@ Commands:
   query <text>        Search models by natural language
   set <model>         Set all roles to the same model (supports fuzzy matching)
   set <model> --role=<role>  Set specific role only
-  set <model> --session      Set model for current session (with backup/restore)
-  restore             Restore router config from session backup
   import              Import providers from cc-switch
   status              Show CCR installation and configuration status
   help                Show this help message
@@ -1091,8 +1022,7 @@ Examples:
   ccr-model query claude
   ccr-model set glm-5              # Set all roles to glm-5
   ccr-model set m2.5 --role=think  # Set only think role
-  ccr-model set opus --session     # Session-only, restore with 'ccr-model restore'
-  ccr-model restore                # Restore after session mode
+  ccr-model set m2.5 --role=webSearch  # Set only webSearch role
   ccr-model import
   ccr-model status
       `);
