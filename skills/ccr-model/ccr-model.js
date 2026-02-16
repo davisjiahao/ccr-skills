@@ -695,7 +695,10 @@ function setModel(query, args) {
     process.exit(1);
   }
 
-  const matches = fuzzyMatch(models, query);
+  // Filter out option flags from query
+  const cleanQuery = query.replace(/--\S+/g, '').trim();
+
+  const matches = fuzzyMatch(models, cleanQuery);
 
   if (matches.length === 0) {
     console.error(`No models found matching: ${query}`);
@@ -729,56 +732,106 @@ function setModel(query, args) {
 
   // Parse options
   const isSession = args.includes('--session') || args.includes('-s');
-  const isTemp = args.includes('--temp') || args.includes('-t');
+  const roleArg = args.find(a => a.startsWith('--role=') || a.startsWith('-r='));
+  const role = roleArg ? roleArg.split('=')[1] : null;
 
-  if (isSession || isTemp) {
-    // Session-level: set via environment variable (won't persist)
+  // Valid roles
+  const validRoles = ['default', 'think', 'longContext', 'webSearch', 'background', 'image'];
+
+  // Get existing config
+  const config = getCCRConfig();
+  const existingRouter = config?.Router || {};
+
+  if (isSession) {
+    // True session-level: backup config, set model, will restore on next session
     console.log(`✅ Setting session model: ${fullModelName}`);
-    console.log(`   Format: ${ccrFormat}`);
-    console.log(`\nℹ️  Session model active! Will reset when Claude Code restarts.`);
-    console.log(`   To use in current session, set in settings.json or restart Claude Code.`);
 
-    // Also update CCR config as fallback
-    const config = getCCRConfig();
+    // Backup current router config to a temp file
+    const backupPath = CCR_CONFIG_PATH + '.backup';
+    fs.writeFileSync(backupPath, JSON.stringify(existingRouter, null, 2));
+
+    // Set the model
     config.Router = config.Router || {};
-    config.Router.default = ccrFormat;
+
+    if (role && validRoles.includes(role)) {
+      // Set specific role
+      config.Router[role] = ccrFormat;
+      console.log(`   Role: ${role} = ${ccrFormat}`);
+    } else if (!role) {
+      // Set all roles
+      config.Router.default = ccrFormat;
+      config.Router.think = ccrFormat;
+      config.Router.background = ccrFormat;
+      config.Router.longContext = ccrFormat;
+      config.Router.webSearch = ccrFormat;
+      config.Router.image = ccrFormat;
+      console.log(`   All roles set to: ${ccrFormat}`);
+    }
+
     saveCCRConfig(config);
 
-    const settings = getClaudeSettings();
-    settings.model = fullModelName;
-    saveClaudeSettings(settings);
-
-    console.log(`\n✅ Model updated!`);
+    console.log(`\nℹ️  Session model active!`);
+    console.log(`   Config backed up to: ${backupPath}`);
+    console.log(`   Will restore when you run: ccr-model restore`);
     return;
   }
 
+  // Permanent change
   console.log(`✅ Setting model to: ${fullModelName}`);
 
-  // Update CCR config router.default (preserve other router configs)
-  const config = getCCRConfig();
   config.Router = config.Router || {};
-  config.Router.default = ccrFormat;
 
-  // Preserve existing role-specific configs if they exist
-  const existingRouter = getCCRConfig()?.Router || {};
-  if (existingRouter.think) config.Router.think = existingRouter.think;
-  if (existingRouter.longContext) config.Router.longContext = existingRouter.longContext;
-  if (existingRouter.longContextThreshold) config.Router.longContextThreshold = existingRouter.longContextThreshold;
-  if (existingRouter.webSearch) config.Router.webSearch = existingRouter.webSearch;
-  if (existingRouter.background) config.Router.background = existingRouter.background;
-  if (existingRouter.image) config.Router.image = existingRouter.image;
+  if (role && validRoles.includes(role)) {
+    // Set specific role only
+    config.Router[role] = ccrFormat;
+    console.log(`   Role '${role}' = ${ccrFormat}`);
+    console.log(`   Other roles unchanged.`);
+  } else if (!role) {
+    // Set all roles (default behavior)
+    config.Router.default = ccrFormat;
+    config.Router.think = ccrFormat;
+    config.Router.background = ccrFormat;
+    config.Router.longContext = ccrFormat;
+    config.Router.webSearch = ccrFormat;
+    config.Router.image = ccrFormat;
+    console.log(`   All roles = ${ccrFormat}`);
+  }
 
   saveCCRConfig(config);
 
-  // Also update Claude settings
+  // Update Claude settings for display
   const settings = getClaudeSettings();
   settings.model = fullModelName;
   saveClaudeSettings(settings);
 
   console.log(`\n✅ Model updated successfully!`);
-  console.log(`   Router default: ${ccrFormat}`);
-  console.log(`   Claude settings model: ${fullModelName}`);
   console.log(`\nℹ️  CCR 立即生效，无需重启 daemon`);
+}
+
+function restoreFromBackup() {
+  const backupPath = CCR_CONFIG_PATH + '.backup';
+
+  if (!fs.existsSync(backupPath)) {
+    console.log('❌ No backup found. Run "ccr-model set --session" first to create a backup.');
+    process.exit(1);
+  }
+
+  try {
+    const backup = JSON.parse(fs.readFileSync(backupPath, 'utf-8'));
+    const config = getCCRConfig();
+
+    config.Router = backup;
+    saveCCRConfig(config);
+
+    // Delete backup file
+    fs.unlinkSync(backupPath);
+
+    console.log('✅ Router config restored from backup!');
+    console.log(`   Backup file deleted.`);
+  } catch (e) {
+    console.error('❌ Failed to restore:', e.message);
+    process.exit(1);
+  }
 }
 
 function importProviders() {
@@ -1002,6 +1055,10 @@ function main() {
       importProviders();
       break;
 
+    case 'restore':
+      restoreFromBackup();
+      break;
+
     case 'status':
       showStatus();
       showModelInfo = false;
@@ -1018,21 +1075,26 @@ Usage:
 Commands:
   list                List all available models
   query <text>        Search models by natural language
-  set <model>         Set the default model (supports fuzzy matching)
-  set <model> --session  Set model for current session only
+  set <model>         Set all roles to the same model (supports fuzzy matching)
+  set <model> --role=<role>  Set specific role only
+  set <model> --session      Set model for current session (with backup/restore)
+  restore             Restore router config from session backup
   import              Import providers from cc-switch
   status              Show CCR installation and configuration status
   help                Show this help message
 
+Roles:
+  default, think, longContext, webSearch, background, image
+
 Examples:
   ccr-model list
   ccr-model query claude
-  ccr-model set glm-5
-  ccr-model set M2.5          # Matches MiniMax-M2.5
-  ccr-model set min2.5        # Also matches MiniMax-M2.5
-  ccr-model set opus --session  # Session-only (resets on restart)
-  ccr-model import            # Import from cc-switch
-  ccr-model status            # Check CCR status
+  ccr-model set glm-5              # Set all roles to glm-5
+  ccr-model set m2.5 --role=think  # Set only think role
+  ccr-model set opus --session     # Session-only, restore with 'ccr-model restore'
+  ccr-model restore                # Restore after session mode
+  ccr-model import
+  ccr-model status
       `);
       break;
 
