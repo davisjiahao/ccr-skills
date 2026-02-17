@@ -19,6 +19,7 @@ const CCR_CONFIG_PATH = path.join(process.env.HOME, '.claude-code-router', 'conf
 const CCR_PID_PATH = path.join(process.env.HOME, '.claude-code-router', '.claude-code-router.pid');
 const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME, '.claude', 'settings.json');
 const CC_SWITCH_DB_PATH = path.join(process.env.HOME, '.cc-switch', 'cc-switch.db');
+const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME, '.claude', 'projects');
 
 // ============ Utility Functions ============
 
@@ -687,6 +688,188 @@ function queryModels(query) {
   console.log('');
 }
 
+// ============ Project & Session Level Config ============
+
+/**
+ * Get current project ID from working directory or environment
+ */
+function getCurrentProjectId() {
+  const cwd = process.cwd();
+
+  if (!fs.existsSync(CLAUDE_PROJECTS_DIR)) {
+    return null;
+  }
+
+  const projects = fs.readdirSync(CLAUDE_PROJECTS_DIR);
+  const cwdFolder = path.basename(cwd);
+
+  // Find project where projectId ends with the cwd folder name
+  // E.g., cwdFolder = "ccr-skills" matches projectId "-Users-hungrywu-Documents-opensrc-ccr-skills"
+  for (const projectId of projects) {
+    if (projectId.endsWith('-' + cwdFolder)) {
+      const projectPath = path.join(CLAUDE_PROJECTS_DIR, projectId);
+      if (fs.statSync(projectPath).isDirectory()) {
+        return projectId;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Get current session ID from Claude Code session file
+ */
+function getCurrentSessionId() {
+  const projectId = getCurrentProjectId();
+  if (!projectId) return null;
+
+  const projectDir = path.join(CLAUDE_PROJECTS_DIR, projectId);
+
+  if (!fs.existsSync(projectDir)) return null;
+
+  // Find the most recent .jsonl file (session file)
+  const files = fs.readdirSync(projectDir)
+    .filter(f => f.endsWith('.jsonl'))
+    .sort((a, b) => {
+      const statA = fs.statSync(path.join(projectDir, a));
+      const statB = fs.statSync(path.join(projectDir, b));
+      return statB.mtimeMs - statA.mtimeMs;
+    });
+
+  if (files.length > 0) {
+    // Session ID is the filename without .jsonl extension
+    return files[0].replace('.jsonl', '');
+  }
+
+  return null;
+}
+
+/**
+ * Set model at project or session level
+ */
+function setModelAtLevel(query, args, level) {
+  const models = getAllModels();
+  if (models.length === 0) {
+    log('No models available.', 'error');
+    console.log('Try: ccr-model import   to import from cc-switch');
+    process.exit(1);
+  }
+
+  // Filter out option flags from query
+  const cleanQuery = query.replace(/--\S+/g, '').trim();
+  const matches = fuzzyMatch(models, cleanQuery);
+
+  if (matches.length === 0) {
+    console.error(`No models found matching: ${cleanQuery}`);
+    process.exit(1);
+  }
+
+  const uniqueMatches = [];
+  const seen = new Set();
+  for (const m of matches) {
+    if (!seen.has(m.fullName)) {
+      seen.add(m.fullName);
+      uniqueMatches.push(m);
+    }
+  }
+
+  const selected = uniqueMatches[0];
+  const fullModelName = selected.fullName;
+  const ccrFormat = fullModelName.replace('/', ',');
+
+  // Parse role option
+  const roleArg = args.find(a => a.startsWith('--role=') || a.startsWith('-r='));
+  const role = roleArg ? roleArg.split('=')[1] : null;
+  const validRoles = ['default', 'think', 'longContext', 'webSearch', 'background', 'image'];
+
+  // Get project ID
+  const projectId = getCurrentProjectId();
+  const sessionId = getCurrentSessionId();
+
+  if (level === 'project') {
+    // Project-level config
+    if (!projectId) {
+      console.error('❌ Cannot determine current project. Make sure you are in a Claude Code project.');
+      process.exit(1);
+    }
+
+    const projectConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, 'config.json');
+
+    // Ensure directory exists
+    const projectDir = path.dirname(projectConfigPath);
+    if (!fs.existsSync(projectDir)) {
+      fs.mkdirSync(projectDir, { recursive: true });
+    }
+
+    // Read or create project config
+    let projectConfig = {};
+    if (fs.existsSync(projectConfigPath)) {
+      try {
+        projectConfig = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
+      } catch (e) {
+        projectConfig = {};
+      }
+    }
+
+    projectConfig.Router = projectConfig.Router || {};
+
+    if (role && validRoles.includes(role)) {
+      projectConfig.Router[role] = ccrFormat;
+      console.log(`✅ Project-level: Set role '${role}' to ${fullModelName}`);
+    } else {
+      // Set all roles
+      projectConfig.Router.default = ccrFormat;
+      projectConfig.Router.think = ccrFormat;
+      projectConfig.Router.background = ccrFormat;
+      projectConfig.Router.longContext = ccrFormat;
+      projectConfig.Router.webSearch = ccrFormat;
+      projectConfig.Router.image = ccrFormat;
+      console.log(`✅ Project-level: Set all roles to ${fullModelName}`);
+    }
+
+    fs.writeFileSync(projectConfigPath, JSON.stringify(projectConfig, null, 2));
+    console.log(`   Config saved to: ${projectConfigPath}`);
+    console.log(`\nℹ️  Project-level config will override global config for this project.`);
+    return;
+  }
+
+  if (level === 'session') {
+    // Session-level config
+    if (!projectId || !sessionId) {
+      console.error('❌ Cannot determine current project/session. Make sure you are in a Claude Code project with an active session.');
+      process.exit(1);
+    }
+
+    const sessionConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, `${sessionId}.json`);
+
+    // Read or create session config
+    let sessionConfig = {};
+    if (fs.existsSync(sessionConfigPath)) {
+      try {
+        sessionConfig = JSON.parse(fs.readFileSync(sessionConfigPath, 'utf-8'));
+      } catch (e) {
+        sessionConfig = {};
+      }
+    }
+
+    sessionConfig.Router = sessionConfig.Router || {};
+
+    if (role && validRoles.includes(role)) {
+      sessionConfig.Router[role] = ccrFormat;
+      console.log(`✅ Session-level: Set role '${role}' to ${fullModelName}`);
+    } else {
+      sessionConfig.Router.default = ccrFormat;
+      console.log(`✅ Session-level: Set default to ${fullModelName}`);
+    }
+
+    fs.writeFileSync(sessionConfigPath, JSON.stringify(sessionConfig, null, 2));
+    console.log(`   Config saved to: ${sessionConfigPath}`);
+    console.log(`\nℹ️  Session-level config has highest priority and will override project/global config.`);
+    return;
+  }
+}
+
 function setModel(query, args) {
   const models = getAllModels();
   if (models.length === 0) {
@@ -769,6 +952,71 @@ function setModel(query, args) {
 
   console.log(`\n✅ Model updated successfully!`);
   console.log(`\nℹ️  CCR 立即生效，无需重启 daemon`);
+}
+
+function showProjectConfig() {
+  const projectId = getCurrentProjectId();
+  if (!projectId) {
+    console.log('❌ Cannot determine current project.');
+    return;
+  }
+
+  const projectConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, 'config.json');
+
+  console.log('═══════════════════════════════════════════════════');
+  console.log(`              Project: ${projectId}`);
+  console.log('═══════════════════════════════════════════════════\n');
+
+  if (fs.existsSync(projectConfigPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
+      if (config.Router) {
+        console.log('  Project-level Router Config:');
+        console.log(JSON.stringify(config.Router, null, 2));
+      } else {
+        console.log('  No Router config found in project config.');
+      }
+    } catch (e) {
+      console.log('  Error reading project config:', e.message);
+    }
+  } else {
+    console.log('  No project config file found.');
+  }
+  console.log('');
+}
+
+function showSessionConfig() {
+  const projectId = getCurrentProjectId();
+  const sessionId = getCurrentSessionId();
+
+  if (!projectId || !sessionId) {
+    console.log('❌ Cannot determine current project/session.');
+    return;
+  }
+
+  const sessionConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, `${sessionId}.json`);
+
+  console.log('═══════════════════════════════════════════════════');
+  console.log(`              Session: ${sessionId}`);
+  console.log(`              Project: ${projectId}`);
+  console.log('═══════════════════════════════════════════════════\n');
+
+  if (fs.existsSync(sessionConfigPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(sessionConfigPath, 'utf-8'));
+      if (config.Router) {
+        console.log('  Session-level Router Config:');
+        console.log(JSON.stringify(config.Router, null, 2));
+      } else {
+        console.log('  No Router config found in session config.');
+      }
+    } catch (e) {
+      console.log('  Error reading session config:', e.message);
+    }
+  } else {
+    console.log('  No session config file found.');
+  }
+  console.log('');
 }
 
 function importProviders() {
@@ -985,7 +1233,28 @@ function main() {
         console.error('Please provide a model to set');
         process.exit(1);
       }
+
+      // Check for level flags
+      if (args.includes('--project')) {
+        setModelAtLevel(modelQuery, args, 'project');
+        return;
+      }
+      if (args.includes('--session')) {
+        setModelAtLevel(modelQuery, args, 'session');
+        return;
+      }
+
       setModel(modelQuery, args);
+      break;
+
+    case 'project':
+      // Show current project config
+      showProjectConfig();
+      break;
+
+    case 'session':
+      // Show current session config
+      showSessionConfig();
       break;
 
     case 'import':
@@ -1008,11 +1277,20 @@ Usage:
 Commands:
   list                List all available models
   query <text>        Search models by natural language
-  set <model>         Set all roles to the same model (supports fuzzy matching)
+  set <model>         Set global model (all roles)
+  set <model> --project     Set project-level model
+  set <model> --session    Set session-level model
   set <model> --role=<role>  Set specific role only
+  project             Show current project config
+  session             Show current session config
   import              Import providers from cc-switch
   status              Show CCR installation and configuration status
   help                Show this help message
+
+Config Levels (priority order):
+  1. Session:  ~/.claude/projects/<id>/<sessionId>.json
+  2. Project:  ~/.claude/projects/<id>/config.json
+  3. Global:   ~/.claude-code-router/config.json
 
 Roles:
   default, think, longContext, webSearch, background, image
@@ -1020,9 +1298,12 @@ Roles:
 Examples:
   ccr-model list
   ccr-model query claude
-  ccr-model set glm-5              # Set all roles to glm-5
+  ccr-model set glm-5              # Set global (all roles)
+  ccr-model set glm-5 --project    # Set for current project
+  ccr-model set glm-5 --session    # Set for current session
   ccr-model set m2.5 --role=think  # Set only think role
-  ccr-model set m2.5 --role=webSearch  # Set only webSearch role
+  ccr-model project                # Show project config
+  ccr-model session                # Show session config
   ccr-model import
   ccr-model status
       `);
