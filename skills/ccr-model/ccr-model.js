@@ -859,8 +859,14 @@ function setModelAtLevel(query, args, level) {
       sessionConfig.Router[role] = ccrFormat;
       console.log(`✅ Session-level: Set role '${role}' to ${fullModelName}`);
     } else {
+      // Set all roles for session level
       sessionConfig.Router.default = ccrFormat;
-      console.log(`✅ Session-level: Set default to ${fullModelName}`);
+      sessionConfig.Router.think = ccrFormat;
+      sessionConfig.Router.background = ccrFormat;
+      sessionConfig.Router.longContext = ccrFormat;
+      sessionConfig.Router.webSearch = ccrFormat;
+      sessionConfig.Router.image = ccrFormat;
+      console.log(`✅ Session-level: Set all roles to ${fullModelName}`);
     }
 
     fs.writeFileSync(sessionConfigPath, JSON.stringify(sessionConfig, null, 2));
