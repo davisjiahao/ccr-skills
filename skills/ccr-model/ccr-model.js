@@ -1098,9 +1098,22 @@ function showStatus() {
   const hasCCSwitch = fs.existsSync(CC_SWITCH_DB_PATH);
   console.log(`  CC-Switch:         ${hasCCSwitch ? '✅ Available' : '⚠️  Not found'}`);
 
-  // Current model
-  const settings = getClaudeSettings();
-  console.log(`  Current Model:     ${settings.model || 'default'}`);
+  // Current model - show effective model based on hierarchy
+  const effective = getEffectiveConfig();
+  const router = effective.config;
+  const level = effective.level;
+  const currentModel = router.default || router.think || router.background ||
+                       router.longContext || router.webSearch || router.image;
+  const displayModel = ccrFormatToDisplay(currentModel) || currentModel || 'default';
+
+  // Show config level indicator
+  const levelIndicators = {
+    global: '🌐',
+    project: '📁',
+    session: '💬'
+  };
+
+  console.log(`  Current Model:     ${displayModel} ${levelIndicators[level] || ''}`);
 
   console.log('');
 
@@ -1113,7 +1126,69 @@ function showStatus() {
   }
 }
 
-// ============ Show Current Model ============
+// ============ Get Effective Model (Session > Project > Global) ============
+
+function getEffectiveConfig() {
+  const projectId = getCurrentProjectId();
+  const sessionId = getCurrentSessionId();
+
+  // Start with global config
+  const globalConfig = getCCRConfig();
+  let effective = {
+    level: 'global',
+    config: globalConfig?.Router || {},
+    projectId: null,
+    sessionId: null
+  };
+
+  // Check project level
+  if (projectId) {
+    const projectConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, 'config.json');
+    if (fs.existsSync(projectConfigPath)) {
+      try {
+        const projectConfig = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
+        if (projectConfig.Router && Object.keys(projectConfig.Router).length > 0) {
+          effective = {
+            level: 'project',
+            config: projectConfig.Router,
+            projectId: projectId,
+            sessionId: null
+          };
+        }
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+  }
+
+  // Check session level (highest priority)
+  if (projectId && sessionId) {
+    const sessionConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, `${sessionId}.json`);
+    if (fs.existsSync(sessionConfigPath)) {
+      try {
+        const sessionConfig = JSON.parse(fs.readFileSync(sessionConfigPath, 'utf-8'));
+        if (sessionConfig.Router && Object.keys(sessionConfig.Router).length > 0) {
+          effective = {
+            level: 'session',
+            config: sessionConfig.Router,
+            projectId: projectId,
+            sessionId: sessionId
+          };
+        }
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+  }
+
+  return effective;
+}
+
+// Convert CCR format (provider,model) to display format (provider/model)
+function ccrFormatToDisplay(ccrFormat) {
+  if (!ccrFormat) return null;
+  return ccrFormat.replace(',', '/');
+}
 
 // Helper to check if model matches (handles both "provider/model" and "provider,model" formats)
 function modelMatches(modelStr, currentModel) {
@@ -1134,18 +1209,30 @@ function modelMatches(modelStr, currentModel) {
 }
 
 function showCurrentModel() {
-  const settings = getClaudeSettings();
+  // Get effective config based on hierarchy (Session > Project > Global)
+  const effective = getEffectiveConfig();
   const config = getCCRConfig();
-  const currentModel = settings.model;
+  const router = effective.config;
+  const level = effective.level;
 
-  if (!currentModel) return;
+  // Get current model (from default role or any role)
+  const currentModel = router.default || router.think || router.background ||
+                       router.longContext || router.webSearch || router.image;
+
+  if (!currentModel) {
+    // Fallback to global settings.model
+    const settings = getClaudeSettings();
+    if (!settings.model) return;
+  }
+
+  const displayModel = ccrFormatToDisplay(currentModel) || currentModel;
 
   // Try to find provider info
   let providerInfo = null;
   for (const provider of (config?.Providers || [])) {
     for (const model of (provider.models || [])) {
       const fullName = `${provider.name}/${model}`;
-      if (fullName === currentModel || model === currentModel || provider.name === currentModel) {
+      if (fullName === displayModel || model === displayModel || provider.name === displayModel) {
         providerInfo = { name: provider.name, model: model };
         break;
       }
@@ -1157,15 +1244,22 @@ function showCurrentModel() {
   console.log('              Current Model');
   console.log('═══════════════════════════════════════════════════\n');
 
+  // Show config level
+  const levelLabels = {
+    global: '🌐 Global',
+    project: '📁 Project',
+    session: '💬 Session'
+  };
+  console.log(`  Config:    ${levelLabels[level] || level}`);
+
   if (providerInfo) {
     console.log(`  Provider:  ${providerInfo.name}`);
     console.log(`  Model:     ${providerInfo.model}`);
   } else {
-    console.log(`  Model:     ${currentModel}`);
+    console.log(`  Model:     ${displayModel}`);
   }
 
   // Show roles (model can have multiple roles)
-  const router = config?.Router || {};
   const roles = [];
 
   if (modelMatches(router.think, currentModel)) {
@@ -1179,6 +1273,9 @@ function showCurrentModel() {
   }
   if (modelMatches(router.background, currentModel)) {
     roles.push('Background 🔄');
+  }
+  if (modelMatches(router.image, currentModel)) {
+    roles.push('Image 🖼️');
   }
 
   // Check if it's the default model
