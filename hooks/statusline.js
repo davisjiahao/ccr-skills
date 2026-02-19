@@ -15,6 +15,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CCR_CONFIG_PATH = path.join(process.env.HOME, '.claude-code-router', 'config.json');
+const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME, '.claude', 'settings.json');
 const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME, '.claude', 'projects');
 const CCR_PROJECTS_DIR = path.join(process.env.HOME, '.claude-code-router');
 
@@ -153,8 +154,60 @@ function ccrFormatToDisplay(ccrFormat) {
   return ccrFormat.replace(',', '/');
 }
 
+/**
+ * Check if Claude Code is routing through CCR by comparing
+ * ANTHROPIC_BASE_URL against CCR's configured HOST:PORT.
+ */
+function isCCRActive() {
+  const config = getCCRConfig();
+  if (!config) return false;
+
+  const ccrHost = config.HOST || '127.0.0.1';
+  const ccrPort = config.PORT || 3456;
+  const ccrOrigin = `http://${ccrHost}:${ccrPort}`;
+
+  // Check process env
+  let baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+
+  // Check settings.json env
+  if (!baseUrl) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8'));
+      baseUrl = settings.env?.ANTHROPIC_BASE_URL || '';
+    } catch (e) {}
+  }
+
+  // Check settings.local.json env
+  if (!baseUrl) {
+    try {
+      const localPath = path.join(process.env.HOME, '.claude', 'settings.local.json');
+      const local = JSON.parse(fs.readFileSync(localPath, 'utf-8'));
+      baseUrl = local.env?.ANTHROPIC_BASE_URL || '';
+    } catch (e) {}
+  }
+
+  if (!baseUrl) return false;
+
+  const normalized = baseUrl.replace(/\/+$/, '');
+  return normalized === ccrOrigin || normalized.startsWith(ccrOrigin + '/');
+}
+
 function main() {
   const stdinData = readStdin();
+
+  // Context window from Claude Code stdin
+  const ctxPct = Math.round(stdinData?.context_window?.used_percentage || 0);
+  const barWidth = 10;
+  const filled = Math.round(ctxPct / 100 * barWidth);
+  const empty = barWidth - filled;
+  const bar = '\u2588'.repeat(filled) + '\u2591'.repeat(empty);
+
+  // If not routing through CCR, show only context bar (no CCR model info)
+  if (!isCCRActive()) {
+    console.log(`${bar} ${ctxPct}% ctx`);
+    return;
+  }
+
   const config = getCCRConfig();
   const effective = getEffectiveConfig();
   const router = effective.config;
@@ -163,7 +216,6 @@ function main() {
   const currentModel = router.default || router.think || router.background ||
                        router.longContext || router.webSearch || router.image;
 
-  // Build model display
   let modelDisplay = '';
 
   if (currentModel) {
@@ -198,25 +250,13 @@ function main() {
       modelDisplay += ` [${roles.join(',')}]`;
     }
   } else {
-    // Fallback to Claude Code's own model info
-    const ccModel = stdinData?.model?.display_name;
-    modelDisplay = ccModel || 'unknown';
+    modelDisplay = 'CCR (no model)';
   }
 
   // Level indicator
   const levelIcons = { global: '\u{1F310}', project: '\u{1F4C1}', session: '\u{1F4AC}' };
   const levelIcon = levelIcons[level] || '';
 
-  // Context window from Claude Code stdin
-  const ctxPct = Math.round(stdinData?.context_window?.used_percentage || 0);
-
-  // Build context bar (10 chars wide)
-  const barWidth = 10;
-  const filled = Math.round(ctxPct / 100 * barWidth);
-  const empty = barWidth - filled;
-  const bar = '\u2588'.repeat(filled) + '\u2591'.repeat(empty);
-
-  // Output to stdout
   console.log(`${levelIcon} ${modelDisplay} | ${bar} ${ctxPct}% ctx`);
 }
 

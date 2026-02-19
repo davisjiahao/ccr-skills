@@ -153,6 +153,47 @@ function getClaudeSettings() {
   }
 }
 
+/**
+ * Check if Claude Code is currently routing through CCR.
+ *
+ * Detects by checking if ANTHROPIC_BASE_URL points to CCR's HOST:PORT.
+ * The env var can be set in process env, settings.json, or settings.local.json.
+ */
+function isCCRActive() {
+  const config = getCCRConfig();
+  if (!config) return false;
+
+  const ccrHost = config.HOST || '127.0.0.1';
+  const ccrPort = config.PORT || 3456;
+  const ccrOrigin = `http://${ccrHost}:${ccrPort}`;
+
+  // Check process env first
+  let baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+
+  // Check Claude settings.json env
+  if (!baseUrl) {
+    const settings = getClaudeSettings();
+    baseUrl = settings.env?.ANTHROPIC_BASE_URL || '';
+  }
+
+  // Check settings.local.json env
+  if (!baseUrl) {
+    try {
+      const localPath = path.join(process.env.HOME, '.claude', 'settings.local.json');
+      const local = JSON.parse(fs.readFileSync(localPath, 'utf-8'));
+      baseUrl = local.env?.ANTHROPIC_BASE_URL || '';
+    } catch (e) {
+      // No local settings
+    }
+  }
+
+  if (!baseUrl) return false;
+
+  // Normalize and compare
+  const normalized = baseUrl.replace(/\/+$/, '');
+  return normalized === ccrOrigin || normalized.startsWith(ccrOrigin + '/');
+}
+
 // ============ CC-Switch Import ============
 
 function getCCSwitchProviders() {
@@ -1206,6 +1247,10 @@ function showStatus() {
   const hasCCSwitch = fs.existsSync(CC_SWITCH_DB_PATH);
   console.log(`  CC-Switch:         ${hasCCSwitch ? '✅ Available' : '⚠️  Not found'}`);
 
+  // Check if CCR is actively being used
+  const ccrActive = isCCRActive();
+  console.log(`  CCR Routing:       ${ccrActive ? '✅ Active (ANTHROPIC_BASE_URL → CCR)' : '⚠️  Inactive (direct Anthropic API)'}`);
+
   // Project & Session info
   const projectId = getCurrentProjectId();
   const sessionResult = resolveSessionId();
@@ -1221,22 +1266,27 @@ function showStatus() {
     console.log(`  Session Source:    ${sourceLabels[sessionResult.source]}`);
   }
 
-  // Current model - show effective model based on hierarchy
-  const effective = getEffectiveConfig();
-  const router = effective.config;
-  const level = effective.level;
-  const currentModel = router.default || router.think || router.background ||
-                       router.longContext || router.webSearch || router.image;
-  const displayModel = ccrFormatToDisplay(currentModel) || currentModel || 'default';
+  // Current model display
+  if (ccrActive) {
+    const effective = getEffectiveConfig();
+    const router = effective.config;
+    const level = effective.level;
+    const currentModel = router.default || router.think || router.background ||
+                         router.longContext || router.webSearch || router.image;
+    const displayModel = ccrFormatToDisplay(currentModel) || currentModel || 'N/A';
 
-  const levelLabels = {
-    global: '🌐 Global',
-    project: '📁 Project',
-    session: '💬 Session'
-  };
+    const levelLabels = {
+      global: '🌐 Global',
+      project: '📁 Project',
+      session: '💬 Session'
+    };
 
-  console.log(`  Current Model:     ${displayModel}`);
-  console.log(`  Model Source:      ${levelLabels[level] || level}`);
+    console.log(`  Current Model:     ${displayModel}`);
+    console.log(`  Model Source:      ${levelLabels[level] || level}`);
+  } else {
+    const settings = getClaudeSettings();
+    console.log(`  Current Model:     ${settings.model || 'default'} (native)`);
+  }
 
   console.log('');
 
@@ -1342,20 +1392,29 @@ function modelMatches(modelStr, currentModel) {
 }
 
 function showCurrentModel() {
-  // Get effective config based on hierarchy (Session > Project > Global)
+  console.log('\n═══════════════════════════════════════════════════');
+  console.log('              Current Model');
+  console.log('═══════════════════════════════════════════════════\n');
+
+  if (!isCCRActive()) {
+    const settings = getClaudeSettings();
+    console.log(`  Model:     ${settings.model || 'default'} (native Anthropic, not routed through CCR)`);
+    console.log('');
+    return;
+  }
+
   const effective = getEffectiveConfig();
   const config = getCCRConfig();
   const router = effective.config;
   const level = effective.level;
 
-  // Get current model (from default role or any role)
   const currentModel = router.default || router.think || router.background ||
                        router.longContext || router.webSearch || router.image;
 
   if (!currentModel) {
-    // Fallback to global settings.model
-    const settings = getClaudeSettings();
-    if (!settings.model) return;
+    console.log('  Model:     N/A (CCR active but no model configured)');
+    console.log('');
+    return;
   }
 
   const displayModel = ccrFormatToDisplay(currentModel) || currentModel;
@@ -1373,11 +1432,6 @@ function showCurrentModel() {
     if (providerInfo) break;
   }
 
-  console.log('\n═══════════════════════════════════════════════════');
-  console.log('              Current Model');
-  console.log('═══════════════════════════════════════════════════\n');
-
-  // Show config level
   const levelLabels = {
     global: '🌐 Global',
     project: '📁 Project',
@@ -1392,36 +1446,16 @@ function showCurrentModel() {
     console.log(`  Model:     ${displayModel}`);
   }
 
-  // Show roles (model can have multiple roles)
+  // Show roles
   const roles = [];
+  if (modelMatches(router.think, currentModel)) roles.push('Think 🧠');
+  if (modelMatches(router.longContext, currentModel)) roles.push('Long Context 📚');
+  if (modelMatches(router.webSearch, currentModel)) roles.push('Web Search 🌐');
+  if (modelMatches(router.background, currentModel)) roles.push('Background 🔄');
+  if (modelMatches(router.image, currentModel)) roles.push('Image 🖼️');
+  if (router.default === currentModel) roles.push('Default');
 
-  if (modelMatches(router.think, currentModel)) {
-    roles.push('Think 🧠');
-  }
-  if (modelMatches(router.longContext, currentModel)) {
-    roles.push('Long Context 📚');
-  }
-  if (modelMatches(router.webSearch, currentModel)) {
-    roles.push('Web Search 🌐');
-  }
-  if (modelMatches(router.background, currentModel)) {
-    roles.push('Background 🔄');
-  }
-  if (modelMatches(router.image, currentModel)) {
-    roles.push('Image 🖼️');
-  }
-
-  // Check if it's the default model
-  if (router.default === currentModel) {
-    roles.push('Default');
-  }
-
-  if (roles.length > 0) {
-    console.log(`  Role:      ${roles.join(', ')}`);
-  } else {
-    console.log(`  Role:      Default`);
-  }
-
+  console.log(`  Role:      ${roles.length > 0 ? roles.join(', ') : 'Default'}`);
   console.log('');
 }
 
