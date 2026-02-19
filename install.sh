@@ -27,62 +27,79 @@ cp -r "$SCRIPT_DIR/skills/ccr-model/"* "$SKILL_DIR/"
 echo "📋 Copying hooks..."
 cp -r "$SCRIPT_DIR/hooks" "$SKILL_DIR/"
 
-# 3. Update settings.json with hook configuration
-echo "⚙️  Configuring hooks..."
+# 4. Update settings.json with hook and statusline configuration
+echo "⚙️  Configuring hooks and statusline..."
 
 # Check if settings.json exists
 if [ ! -f "$SETTINGS_FILE" ]; then
     echo "{}" > "$SETTINGS_FILE"
 fi
 
-# Use Node.js to merge hook config (more reliable than jq)
+# Use Node.js to merge hook + statusline config (more reliable than jq)
 node -e "
 const fs = require('fs');
 const settingsPath = '$SETTINGS_FILE';
-const hookPath = '$SKILL_DIR/hooks/show-model.js';
+const sessionStartHookPath = '$SKILL_DIR/hooks/session-start.js';
+const statuslinePath = '$SKILL_DIR/hooks/statusline.js';
 
 try {
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-
-    // Initialize hooks if not exists
     if (!settings.hooks) settings.hooks = {};
-    if (!settings.hooks.PostToolUse) settings.hooks.PostToolUse = [];
 
-    // Check if hook already exists
-    const hookExists = settings.hooks.PostToolUse.some(h =>
+    // --- Remove legacy PostToolUse show-model.js hook ---
+    if (settings.hooks.PostToolUse) {
+        settings.hooks.PostToolUse = settings.hooks.PostToolUse.filter(h =>
+            !(h.hooks && h.hooks.some(sub =>
+                sub.command && sub.command.includes('show-model.js')
+            ))
+        );
+        if (settings.hooks.PostToolUse.length === 0) {
+            delete settings.hooks.PostToolUse;
+        }
+        console.log('✅ Legacy PostToolUse hook removed');
+    }
+
+    // --- SessionStart hook (session ID caching, fires once) ---
+    if (!settings.hooks.SessionStart) settings.hooks.SessionStart = [];
+
+    const hookExists = settings.hooks.SessionStart.some(h =>
         h.hooks && h.hooks.some(sub =>
-            sub.command && sub.command.includes('show-model.js')
+            sub.command && sub.command.includes('session-start.js')
         )
     );
 
     if (!hookExists) {
-        settings.hooks.PostToolUse.push({
+        settings.hooks.SessionStart.push({
             matcher: '',
             hooks: [{
                 type: 'command',
-                command: 'node ' + hookPath
+                command: 'node ' + sessionStartHookPath
             }]
         });
-        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-        console.log('✅ Hook configured successfully');
+        console.log('✅ SessionStart hook configured');
     } else {
-        console.log('ℹ️  Hook already configured, updating path...');
-
-        // Update existing hook path
-        settings.hooks.PostToolUse.forEach(h => {
+        settings.hooks.SessionStart.forEach(h => {
             if (h.hooks) {
                 h.hooks.forEach(sub => {
-                    if (sub.command && sub.command.includes('show-model.js')) {
-                        sub.command = 'node ' + hookPath;
+                    if (sub.command && sub.command.includes('session-start.js')) {
+                        sub.command = 'node ' + sessionStartHookPath;
                     }
                 });
             }
         });
-        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-        console.log('✅ Hook path updated');
+        console.log('✅ SessionStart hook updated');
     }
+
+    // --- StatusLine (model display) ---
+    settings.statusLine = {
+        type: 'command',
+        command: 'node ' + statuslinePath
+    };
+    console.log('✅ StatusLine configured');
+
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 } catch (e) {
-    console.error('❌ Error configuring hooks:', e.message);
+    console.error('❌ Error configuring settings:', e.message);
     process.exit(1);
 }
 "
