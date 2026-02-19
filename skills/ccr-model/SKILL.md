@@ -1,12 +1,14 @@
 ---
 name: ccr-model
-description: Query and manage Claude Code Router (CCR) models. List all available models, search by natural language, and set the default model with fuzzy matching.
+description: Query and manage Claude Code Router (CCR) models. List all available models, search by natural language, and set the default model with fuzzy matching. Supports global, project, and session-level configuration.
 metadata:
   short-description: CCR model management - list, query, and set models
   examples:
     - ccr-model list
     - ccr-model query claude
     - ccr-model set opus
+    - ccr-model set glm-5 --project
+    - ccr-model set glm-5 --session
     - ccr-model status
     - ccr-model import
 ---
@@ -21,6 +23,15 @@ Manage Claude Code Router models with natural language queries.
 - **Auto-start**: Starts CCR daemon if not running
 - **Auto-import**: Import providers from cc-switch if not configured
 - **Dynamic fuzzy matching**: Automatically generates aliases from configured models (no hardcoded mappings)
+- **Multi-level config**: Supports global, project, and session-level model configuration
+
+## Config Priority
+
+CCR supports three levels of configuration (highest to lowest priority):
+
+1. **Session**: `~/.claude-code-router/<project-id>/<sessionId>.json`
+2. **Project**: `~/.claude-code-router/<project-id>/config.json`
+3. **Global**: `~/.claude-code-router/config.json`
 
 ## Available Commands
 
@@ -40,10 +51,30 @@ Search for models using natural language. Examples:
 - `ccr-model query glm` - Find GLM provider models
 
 ### Set Model
+
+**Global (default):**
 ```
 ccr-model set <model name>
 ```
-Set the default model with dynamic fuzzy matching. The system automatically generates aliases based on your configured models.
+Set the global default model.
+
+**Project-level:**
+```
+ccr-model set <model name> --project
+```
+Set model for current project. Overrides global config.
+
+**Session-level:**
+```
+ccr-model set <model name> --session
+```
+Set model for current session. Highest priority, overrides project and global config.
+
+**Specific role:**
+```
+ccr-model set <model name> --role=<role>
+```
+Set only a specific role. Available roles: `default`, `think`, `longContext`, `webSearch`, `background`, `image`
 
 **How Dynamic Aliases Work:**
 
@@ -57,9 +88,24 @@ For `claude-sonnet-4`:
 - `claudesonnet4`, `cs4`, `sonnet4` (abbreviations)
 
 **Examples:**
-- `ccr-model set glm-5` - Set to glm-5
-- `ccr-model set g5` - Also matches glm-5
-- `ccr-model set m2.5` - Matches MiniMax-M2.5
+- `ccr-model set glm-5` - Set globally
+- `ccr-model set glm-5 --project` - Set for current project
+- `ccr-model set g5 --session` - Set for current session (matches glm-5)
+- `ccr-model set m2.5 --role=think` - Set only think role globally
+
+### View Config
+
+**Project config:**
+```
+ccr-model project
+```
+Show current project-level router configuration.
+
+**Session config:**
+```
+ccr-model session
+```
+Show current session-level router configuration.
 
 ### Import Providers
 ```
@@ -71,7 +117,7 @@ Import providers from cc-switch database. Useful when setting up CCR for the fir
 ```
 ccr-model status
 ```
-Show CCR installation status, daemon status, provider count, and cc-switch availability.
+Show CCR installation status, daemon status, provider count, current model, and config level indicator.
 
 ## Execution
 
@@ -102,6 +148,8 @@ Transformers are detected dynamically based on API base URL patterns:
 
 ## Configuration Files
 
-- CCR Config: `~/.claude-code-router/config.json`
+- CCR Global Config: `~/.claude-code-router/config.json`
+- CCR Project Config: `~/.claude-code-router/<project-id>/config.json`
+- CCR Session Config: `~/.claude-code-router/<project-id>/<sessionId>.json`
 - Claude Settings: `~/.claude/settings.json`
 - CC-Switch DB: `~/.cc-switch/cc-switch.db`

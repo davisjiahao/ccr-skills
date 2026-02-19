@@ -20,6 +20,9 @@ const CCR_PID_PATH = path.join(process.env.HOME, '.claude-code-router', '.claude
 const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME, '.claude', 'settings.json');
 const CC_SWITCH_DB_PATH = path.join(process.env.HOME, '.cc-switch', 'cc-switch.db');
 const CLAUDE_PROJECTS_DIR = path.join(process.env.HOME, '.claude', 'projects');
+// CCR reads project/session configs from its own directory, not from ~/.claude/projects/
+const CCR_PROJECTS_DIR = path.join(process.env.HOME, '.claude-code-router');
+const SESSION_CACHE_DIR = path.join(require('os').tmpdir(), 'ccr-sessions');
 
 // ============ Utility Functions ============
 
@@ -109,6 +112,19 @@ function startCCRDaemon() {
   return false;
 }
 
+function restartCCRDaemon() {
+  log('Restarting CCR daemon to apply changes...', 'action');
+  runCommand('ccr stop', true);
+
+  let attempts = 0;
+  while (attempts < 10 && checkCCRDaemonRunning()) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    attempts++;
+  }
+
+  return startCCRDaemon();
+}
+
 // ============ Config Reading ============
 
 function getCCRConfig() {
@@ -135,10 +151,6 @@ function getClaudeSettings() {
   } catch (e) {
     return { env: {}, model: 'claude-sonnet-4-20250514' };
   }
-}
-
-function saveClaudeSettings(settings) {
-  fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
 }
 
 // ============ CC-Switch Import ============
@@ -245,7 +257,7 @@ function detectTransformer(name, baseUrl) {
     { pattern: 'glm', transformer: 'Anthropic' },
     { pattern: 'minimax', transformer: 'deepseek' },
     { pattern: 'doubao', transformer: 'deepseek' },
-    { pattern: 'byteDance', transformer: 'deepseek' },
+    { pattern: 'bytedance', transformer: 'deepseek' },
     { pattern: 'ark', transformer: 'deepseek' },
     { pattern: 'mimo', transformer: 'deepseek' },
     { pattern: 'xiaomi', transformer: 'deepseek' }
@@ -479,24 +491,6 @@ function getDynamicAliases() {
   return dynamicAliases;
 }
 
-/**
- * Normalize model name using dynamic aliases
- */
-function normalizeModelName(name) {
-  const { modelAliases } = getDynamicAliases();
-  const lower = name.toLowerCase().replace(/[-_\s]/g, '');
-
-  // Check dynamic aliases first
-  if (modelAliases[lower]) {
-    return modelAliases[lower];
-  }
-  if (modelAliases[name.toLowerCase()]) {
-    return modelAliases[name.toLowerCase()];
-  }
-
-  return name;
-}
-
 function fuzzyMatch(models, query) {
   const { modelAliases, providerAliases } = getDynamicAliases();
   const lowerQuery = query.toLowerCase();
@@ -692,6 +686,10 @@ function queryModels(query) {
 
 /**
  * Get current project ID from working directory or environment
+ *
+ * Claude Code project IDs are encoded versions of the project path.
+ * E.g., "/Users/hungrywu/Documents/opensrc/ccr-skills" becomes
+ *      "-Users-hungrywu-Documents-opensrc-ccr-skills"
  */
 function getCurrentProjectId() {
   const cwd = process.cwd();
@@ -701,16 +699,123 @@ function getCurrentProjectId() {
   }
 
   const projects = fs.readdirSync(CLAUDE_PROJECTS_DIR);
-  const cwdFolder = path.basename(cwd);
 
-  // Find project where projectId ends with the cwd folder name
-  // E.g., cwdFolder = "ccr-skills" matches projectId "-Users-hungrywu-Documents-opensrc-ccr-skills"
+  // Method 1: Try exact match by encoding the cwd path
+  // Claude encodes path as: leading slash becomes leading dash, other slashes become dashes
+  const encodedCwd = '-' + cwd.replace(/^\//, '').replace(/\//g, '-');
+
+  if (projects.includes(encodedCwd)) {
+    return encodedCwd;
+  }
+
+  // Method 2: Fallback - match by basename (less precise, handles edge cases)
+  const cwdFolder = path.basename(cwd);
+  const candidates = [];
+
   for (const projectId of projects) {
     if (projectId.endsWith('-' + cwdFolder)) {
       const projectPath = path.join(CLAUDE_PROJECTS_DIR, projectId);
       if (fs.statSync(projectPath).isDirectory()) {
-        return projectId;
+        candidates.push(projectId);
       }
+    }
+  }
+
+  // If only one match, use it
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  // If multiple matches, try to find the best one by checking path depth
+  if (candidates.length > 1) {
+    // Prefer the one with more path segments (more specific match)
+    candidates.sort((a, b) => {
+      const segmentsA = (a.match(/-/g) || []).length;
+      const segmentsB = (b.match(/-/g) || []).length;
+      return segmentsB - segmentsA;
+    });
+    return candidates[0];
+  }
+
+  return null;
+}
+
+/**
+ * Get current session ID with source information.
+ *
+ * Priority:
+ * 1. CLAUDE_CODE_SESSION_ID env var (set in MCP-CLI mode)
+ * 2. Session cache file written by show-model hook (keyed by Claude Code PID)
+ * 3. Fallback: most recently modified .jsonl file (unreliable with concurrent sessions)
+ *
+ * @returns {{ id: string, source: 'env'|'cache'|'mtime' } | null}
+ */
+function resolveSessionId() {
+  const envSessionId = process.env.CLAUDE_CODE_SESSION_ID;
+  if (envSessionId) {
+    return { id: envSessionId, source: 'env' };
+  }
+
+  const cachedId = getSessionIdFromCache();
+  if (cachedId) {
+    return { id: cachedId, source: 'cache' };
+  }
+
+  const mtimeId = getSessionIdByMtime(getCurrentProjectId());
+  if (mtimeId) {
+    return { id: mtimeId, source: 'mtime' };
+  }
+
+  return null;
+}
+
+/** Convenience wrapper that returns just the session ID string. */
+function getCurrentSessionId() {
+  const result = resolveSessionId();
+  return result ? result.id : null;
+}
+
+/**
+ * Walk up the process tree to find a session cache file written by the hook.
+ *
+ * Process chain: Claude Code (writes cache) → sh → node ccr-model.js
+ * The hook's process.ppid is Claude Code's PID, so we walk up from our PID
+ * until we find a matching cache file or reach PID 1.
+ */
+function getSessionIdFromCache() {
+  if (!fs.existsSync(SESSION_CACHE_DIR)) return null;
+
+  let pid = process.ppid;
+  const maxDepth = 5; // Claude Code is at most a few levels up
+
+  for (let i = 0; i < maxDepth && pid > 1; i++) {
+    const cachePath = path.join(SESSION_CACHE_DIR, `${pid}.json`);
+    if (fs.existsSync(cachePath)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
+
+        // Validate the cached session is still alive (PID still running)
+        try {
+          process.kill(data.pid, 0);
+        } catch (e) {
+          // Process is dead, remove stale cache
+          try { fs.unlinkSync(cachePath); } catch (_) {}
+          return null;
+        }
+
+        return data.session_id;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Walk up: get parent PID of current pid
+    try {
+      const ppidStr = execSync(`ps -o ppid= -p ${pid}`, { encoding: 'utf-8' }).trim();
+      pid = parseInt(ppidStr, 10);
+      if (isNaN(pid)) break;
+    } catch (e) {
+      break;
     }
   }
 
@@ -718,17 +823,16 @@ function getCurrentProjectId() {
 }
 
 /**
- * Get current session ID from Claude Code session file
+ * Fallback: Get session ID from the most recent .jsonl file.
+ * Unreliable when multiple sessions are open in the same directory.
  */
-function getCurrentSessionId() {
-  const projectId = getCurrentProjectId();
+function getSessionIdByMtime(projectId) {
   if (!projectId) return null;
 
   const projectDir = path.join(CLAUDE_PROJECTS_DIR, projectId);
 
   if (!fs.existsSync(projectDir)) return null;
 
-  // Find the most recent .jsonl file (session file)
   const files = fs.readdirSync(projectDir)
     .filter(f => f.endsWith('.jsonl'))
     .sort((a, b) => {
@@ -738,7 +842,6 @@ function getCurrentSessionId() {
     });
 
   if (files.length > 0) {
-    // Session ID is the filename without .jsonl extension
     return files[0].replace('.jsonl', '');
   }
 
@@ -747,6 +850,7 @@ function getCurrentSessionId() {
 
 /**
  * Set model at project or session level
+ * CCR reads configs from ~/.claude-code-router/<project-id>/ directory
  */
 function setModelAtLevel(query, args, level) {
   const models = getAllModels();
@@ -785,16 +889,15 @@ function setModelAtLevel(query, args, level) {
 
   // Get project ID
   const projectId = getCurrentProjectId();
-  const sessionId = getCurrentSessionId();
 
   if (level === 'project') {
-    // Project-level config
+    // Project-level config - CCR reads from ~/.claude-code-router/<project-id>/config.json
     if (!projectId) {
       console.error('❌ Cannot determine current project. Make sure you are in a Claude Code project.');
       process.exit(1);
     }
 
-    const projectConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, 'config.json');
+    const projectConfigPath = path.join(CCR_PROJECTS_DIR, projectId, 'config.json');
 
     // Ensure directory exists
     const projectDir = path.dirname(projectConfigPath);
@@ -830,18 +933,19 @@ function setModelAtLevel(query, args, level) {
 
     fs.writeFileSync(projectConfigPath, JSON.stringify(projectConfig, null, 2));
     console.log(`   Config saved to: ${projectConfigPath}`);
-    console.log(`\nℹ️  Project-level config will override global config for this project.`);
+    restartCCRDaemon();
     return;
   }
 
   if (level === 'session') {
-    // Session-level config
+    // Session-level config - CCR reads from ~/.claude-code-router/<project-id>/<sessionId>.json
+    const sessionId = getCurrentSessionId();
     if (!projectId || !sessionId) {
       console.error('❌ Cannot determine current project/session. Make sure you are in a Claude Code project with an active session.');
       process.exit(1);
     }
 
-    const sessionConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, `${sessionId}.json`);
+    const sessionConfigPath = path.join(CCR_PROJECTS_DIR, projectId, `${sessionId}.json`);
 
     // Read or create session config
     let sessionConfig = {};
@@ -871,7 +975,7 @@ function setModelAtLevel(query, args, level) {
 
     fs.writeFileSync(sessionConfigPath, JSON.stringify(sessionConfig, null, 2));
     console.log(`   Config saved to: ${sessionConfigPath}`);
-    console.log(`\nℹ️  Session-level config has highest priority and will override project/global config.`);
+    restartCCRDaemon();
     return;
   }
 }
@@ -951,13 +1055,8 @@ function setModel(query, args) {
 
   saveCCRConfig(config);
 
-  // Update Claude settings for display
-  const settings = getClaudeSettings();
-  settings.model = fullModelName;
-  saveClaudeSettings(settings);
-
   console.log(`\n✅ Model updated successfully!`);
-  console.log(`\nℹ️  CCR 立即生效，无需重启 daemon`);
+  restartCCRDaemon();
 }
 
 function showProjectConfig() {
@@ -967,7 +1066,8 @@ function showProjectConfig() {
     return;
   }
 
-  const projectConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, 'config.json');
+  // CCR reads project config from ~/.claude-code-router/<project-id>/config.json
+  const projectConfigPath = path.join(CCR_PROJECTS_DIR, projectId, 'config.json');
 
   console.log('═══════════════════════════════════════════════════');
   console.log(`              Project: ${projectId}`);
@@ -987,6 +1087,7 @@ function showProjectConfig() {
     }
   } else {
     console.log('  No project config file found.');
+    console.log(`  Expected path: ${projectConfigPath}`);
   }
   console.log('');
 }
@@ -1000,7 +1101,8 @@ function showSessionConfig() {
     return;
   }
 
-  const sessionConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, `${sessionId}.json`);
+  // CCR reads session config from ~/.claude-code-router/<project-id>/<sessionId>.json
+  const sessionConfigPath = path.join(CCR_PROJECTS_DIR, projectId, `${sessionId}.json`);
 
   console.log('═══════════════════════════════════════════════════');
   console.log(`              Session: ${sessionId}`);
@@ -1021,6 +1123,7 @@ function showSessionConfig() {
     }
   } else {
     console.log('  No session config file found.');
+    console.log(`  Expected path: ${sessionConfigPath}`);
   }
   console.log('');
 }
@@ -1067,6 +1170,11 @@ function importProviders() {
         log(`Set default model to: ${config.Router.default}`, 'info');
       }
     }
+
+    // Restart daemon so new providers take effect
+    if (checkCCRDaemonRunning()) {
+      restartCCRDaemon();
+    }
   }
 
   return result;
@@ -1098,6 +1206,21 @@ function showStatus() {
   const hasCCSwitch = fs.existsSync(CC_SWITCH_DB_PATH);
   console.log(`  CC-Switch:         ${hasCCSwitch ? '✅ Available' : '⚠️  Not found'}`);
 
+  // Project & Session info
+  const projectId = getCurrentProjectId();
+  const sessionResult = resolveSessionId();
+  console.log(`  Project ID:        ${projectId || '❌ Not detected'}`);
+  console.log(`  Session ID:        ${sessionResult ? sessionResult.id : '❌ Not detected'}`);
+
+  if (sessionResult) {
+    const sourceLabels = {
+      env: 'env (CLAUDE_CODE_SESSION_ID)',
+      cache: 'cache (hook temp file)',
+      mtime: 'mtime (fallback, may be inaccurate)'
+    };
+    console.log(`  Session Source:    ${sourceLabels[sessionResult.source]}`);
+  }
+
   // Current model - show effective model based on hierarchy
   const effective = getEffectiveConfig();
   const router = effective.config;
@@ -1106,14 +1229,14 @@ function showStatus() {
                        router.longContext || router.webSearch || router.image;
   const displayModel = ccrFormatToDisplay(currentModel) || currentModel || 'default';
 
-  // Show config level indicator
-  const levelIndicators = {
-    global: '🌐',
-    project: '📁',
-    session: '💬'
+  const levelLabels = {
+    global: '🌐 Global',
+    project: '📁 Project',
+    session: '💬 Session'
   };
 
-  console.log(`  Current Model:     ${displayModel} ${levelIndicators[level] || ''}`);
+  console.log(`  Current Model:     ${displayModel}`);
+  console.log(`  Model Source:      ${levelLabels[level] || level}`);
 
   console.log('');
 
@@ -1128,6 +1251,16 @@ function showStatus() {
 
 // ============ Get Effective Model (Session > Project > Global) ============
 
+/**
+ * Get effective router config following CCR's priority:
+ * 1. CUSTOM_ROUTER_PATH (custom JS script) - not handled here
+ * 2. Session: ~/.claude-code-router/<project-id>/<sessionId>.json
+ * 3. Project: ~/.claude-code-router/<project-id>/config.json
+ * 4. Global: ~/.claude-code-router/config.json
+ *
+ * Session ID is resolved via CLAUDE_CODE_SESSION_ID env var when available,
+ * otherwise falls back to mtime-based detection.
+ */
 function getEffectiveConfig() {
   const projectId = getCurrentProjectId();
   const sessionId = getCurrentSessionId();
@@ -1141,9 +1274,9 @@ function getEffectiveConfig() {
     sessionId: null
   };
 
-  // Check project level
+  // Check project level - CCR reads from ~/.claude-code-router/<project-id>/config.json
   if (projectId) {
-    const projectConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, 'config.json');
+    const projectConfigPath = path.join(CCR_PROJECTS_DIR, projectId, 'config.json');
     if (fs.existsSync(projectConfigPath)) {
       try {
         const projectConfig = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
@@ -1161,9 +1294,9 @@ function getEffectiveConfig() {
     }
   }
 
-  // Check session level (highest priority)
+  // Check session level (highest priority) - CCR reads from ~/.claude-code-router/<project-id>/<sessionId>.json
   if (projectId && sessionId) {
-    const sessionConfigPath = path.join(CLAUDE_PROJECTS_DIR, projectId, `${sessionId}.json`);
+    const sessionConfigPath = path.join(CCR_PROJECTS_DIR, projectId, `${sessionId}.json`);
     if (fs.existsSync(sessionConfigPath)) {
       try {
         const sessionConfig = JSON.parse(fs.readFileSync(sessionConfigPath, 'utf-8'));
@@ -1390,9 +1523,9 @@ Commands:
   status              Show CCR installation and configuration status
   help                Show this help message
 
-Config Levels (priority order):
-  1. Session:  ~/.claude/projects/<id>/<sessionId>.json
-  2. Project:  ~/.claude/projects/<id>/config.json
+Config Levels (CCR priority order):
+  1. Session:  ~/.claude-code-router/<project-id>/<sessionId>.json
+  2. Project:  ~/.claude-code-router/<project-id>/config.json
   3. Global:   ~/.claude-code-router/config.json
 
 Roles:

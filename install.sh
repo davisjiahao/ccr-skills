@@ -92,7 +92,7 @@ echo "════════════════════════�
 echo "           Installation Complete!"
 echo "═══════════════════════════════════════════════════"
 echo ""
-echo "Installed to: $SKILLS_DIR"
+echo "Installed to: $SKILL_DIR"
 echo ""
 echo "Available commands:"
 echo "  /ccr-model list      - List all models"

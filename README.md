@@ -7,6 +7,15 @@ Claude Code Router 模型管理技能包，提供便捷的模型切换和状态�
 - **模型管理**: 列出、查询、切换 CCR 模型
 - **模糊匹配**: 支持模型别名 (如 `m2.5` → `MiniMax-M2.5`)
 - **状态显示**: 每次工具使用后自动显示当前模型
+- **多级配置**: 支持全局、项目、会话三级模型配置
+
+## 配置优先级
+
+CCR 支持三级配置，优先级从高到低：
+
+1. **会话级别** `~/.claude-code-router/<project-id>/<sessionId>.json`
+2. **项目级别** `~/.claude-code-router/<project-id>/config.json`
+3. **全局配置** `~/.claude-code-router/config.json`
 
 ## 安装
 
@@ -58,11 +67,29 @@ cp -r hooks ~/.claude/skills/ccr-model/
 
 重启 Claude Code 后，可以使用以下命令：
 
+### 基础命令
+
 ```
-/ccr-model list       # 列出所有模型
-/ccr-model set opus   # 切换模型 (支持模糊匹配)
-/ccr-model status     # 查看状态
-/ccr-model import     # 从 cc-switch 导入 providers
+/ccr-model list              # 列出所有模型
+/ccr-model set opus          # 设置全局模型 (支持模糊匹配)
+/ccr-model status            # 查看状态
+/ccr-model import            # 从 cc-switch 导入 providers
+```
+
+### 项目/会话级别配置
+
+```
+/ccr-model set glm-5 --project    # 设置项目级别模型
+/ccr-model set glm-5 --session    # 设置会话级别模型
+/ccr-model project                # 查看项目配置
+/ccr-model session                # 查看会话配置
+```
+
+### 角色配置
+
+```
+/ccr-model set m2.5 --role=think      # 只设置 think 角色
+/ccr-model set claude --role=longContext  # 只设置长上下文角色
 ```
 
 ## 依赖
@@ -95,10 +122,20 @@ ccr-skills/
     └── show-model.js
 ```
 
+**CCR 配置目录结构：**
+```
+~/.claude-code-router/
+├── config.json                    # 全局配置
+├── <project-id>/                  # 项目配置目录
+│   ├── config.json               # 项目级别配置
+│   └── <sessionId>.json          # 会话级别配置
+└── .claude-code-router.pid        # PID 文件
+```
+
 ## 卸载
 
 ```bash
-rm -rf ~/.claude/skills/ccr-skills
+rm -rf ~/.claude/skills/ccr-model
 # 并从 settings.json 中删除对应的 hooks 配置
 ```
 
