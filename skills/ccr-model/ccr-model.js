@@ -519,9 +519,9 @@ function getDynamicAliases() {
   const config = getCCRConfig();
   if (!config) return { modelAliases: {}, providerAliases: {} };
 
-  // Simple hash to detect config changes
+  // Content-based hash: first 200 chars + length avoids most collisions while staying fast
   const configStr = JSON.stringify(config.Providers);
-  const hash = configStr.length + '_' + (config.Providers?.length || 0);
+  const hash = configStr.length + '_' + (config.Providers?.length || 0) + '_' + configStr.slice(0, 200);
 
   if (dynamicAliases && lastConfigHash === hash) {
     return dynamicAliases;
@@ -1016,7 +1016,7 @@ function setModelAtLevel(query, args, level) {
 
     fs.writeFileSync(sessionConfigPath, JSON.stringify(sessionConfig, null, 2));
     console.log(`   Config saved to: ${sessionConfigPath}`);
-    restartCCRDaemon();
+    // CCR reads session config per-request, no daemon restart needed
     return;
   }
 }
@@ -1206,7 +1206,8 @@ function importProviders() {
     if (!config.Router.default && config.Providers.length > 0) {
       const firstProvider = config.Providers[0];
       if (firstProvider.models && firstProvider.models.length > 0) {
-        config.Router.default = `${firstProvider.name}/${firstProvider.models[0]}`;
+        // CCR config uses comma-separated "provider,model" format
+        config.Router.default = `${firstProvider.name},${firstProvider.models[0]}`;
         saveCCRConfig(config);
         log(`Set default model to: ${config.Router.default}`, 'info');
       }
@@ -1330,7 +1331,8 @@ function getEffectiveConfig() {
     if (fs.existsSync(projectConfigPath)) {
       try {
         const projectConfig = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
-        if (projectConfig.Router && Object.keys(projectConfig.Router).length > 0) {
+        // Only promote if at least one Router value is non-empty (prevent empty config from overriding global)
+        if (projectConfig.Router && Object.values(projectConfig.Router).some(v => v)) {
           effective = {
             level: 'project',
             config: projectConfig.Router,
@@ -1350,7 +1352,8 @@ function getEffectiveConfig() {
     if (fs.existsSync(sessionConfigPath)) {
       try {
         const sessionConfig = JSON.parse(fs.readFileSync(sessionConfigPath, 'utf-8'));
-        if (sessionConfig.Router && Object.keys(sessionConfig.Router).length > 0) {
+        // Only promote if at least one Router value is non-empty
+        if (sessionConfig.Router && Object.values(sessionConfig.Router).some(v => v)) {
           effective = {
             level: 'session',
             config: sessionConfig.Router,
@@ -1446,16 +1449,16 @@ function showCurrentModel() {
     console.log(`  Model:     ${displayModel}`);
   }
 
-  // Show roles
+  // Show active roles for this model; "Default" is implicit if no other roles listed
   const roles = [];
+  if (modelMatches(router.default, currentModel)) roles.push('Default');
   if (modelMatches(router.think, currentModel)) roles.push('Think 🧠');
   if (modelMatches(router.longContext, currentModel)) roles.push('Long Context 📚');
   if (modelMatches(router.webSearch, currentModel)) roles.push('Web Search 🌐');
   if (modelMatches(router.background, currentModel)) roles.push('Background 🔄');
   if (modelMatches(router.image, currentModel)) roles.push('Image 🖼️');
-  if (router.default === currentModel) roles.push('Default');
 
-  console.log(`  Role:      ${roles.length > 0 ? roles.join(', ') : 'Default'}`);
+  console.log(`  Role:      ${roles.length > 0 ? roles.join(', ') : '(none)'}`);
   console.log('');
 }
 

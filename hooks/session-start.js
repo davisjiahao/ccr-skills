@@ -6,8 +6,12 @@
  * Claude Code fires SessionStart once when a session begins,
  * sending { session_id, transcript_path, cwd, ... } via stdin.
  *
- * We persist session_id keyed by Claude Code's PID so that skills
- * (run via Bash tool) can walk the process tree to find it.
+ * This hook persists session_id keyed by Claude Code's PID so that
+ * skills (run via Bash tool) can walk the process tree to find it.
+ *
+ * NOTE: SessionStart hooks must NOT produce any output (stdout or stderr).
+ * Any output causes Claude Code to report "startup hook error".
+ * Model info is displayed by statusline.js instead.
  */
 
 const fs = require('fs');
@@ -50,5 +54,6 @@ function cacheSessionId(hookInput) {
   }
 }
 
+// Main - no output allowed
 const hookInput = readHookInput();
 cacheSessionId(hookInput);

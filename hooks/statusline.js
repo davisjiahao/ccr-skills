@@ -9,6 +9,9 @@
  * Output goes to stdout (required by Claude Code statusLine).
  *
  * Config priority: Session > Project > Global
+ *
+ * Stdin from Claude Code contains:
+ *   { session_id, transcript_path, cwd, context_window: { used_percentage } }
  */
 
 const fs = require('fs');
@@ -39,21 +42,27 @@ function getCCRConfig() {
   }
 }
 
-function getCurrentProjectId() {
-  const cwd = process.cwd();
+/**
+ * Get project ID from a given cwd path (or process.cwd() as fallback).
+ * Claude Code encodes project path as: leading slash → dash, other slashes → dashes.
+ */
+function getCurrentProjectId(cwd) {
+  const dir = cwd || process.cwd();
 
   if (!fs.existsSync(CLAUDE_PROJECTS_DIR)) {
     return null;
   }
 
   const projects = fs.readdirSync(CLAUDE_PROJECTS_DIR);
-  const encodedCwd = '-' + cwd.replace(/^\//, '').replace(/\//g, '-');
 
+  // Method 1: exact encoded path match
+  const encodedCwd = '-' + dir.replace(/^\//, '').replace(/\//g, '-');
   if (projects.includes(encodedCwd)) {
     return encodedCwd;
   }
 
-  const cwdFolder = path.basename(cwd);
+  // Method 2: fallback by folder name suffix
+  const cwdFolder = path.basename(dir);
   const candidates = [];
 
   for (const projectId of projects) {
@@ -70,6 +79,7 @@ function getCurrentProjectId() {
   }
 
   if (candidates.length > 1) {
+    // Prefer the longest match (most specific path)
     candidates.sort((a, b) => {
       const segmentsA = (a.match(/-/g) || []).length;
       const segmentsB = (b.match(/-/g) || []).length;
@@ -81,6 +91,10 @@ function getCurrentProjectId() {
   return null;
 }
 
+/**
+ * Get session ID by most-recently-modified .jsonl file.
+ * Only used as last resort when stdin doesn't provide session_id.
+ */
 function getSessionIdByMtime(projectId) {
   if (!projectId) return null;
 
@@ -98,10 +112,14 @@ function getSessionIdByMtime(projectId) {
   return files.length > 0 ? files[0].replace('.jsonl', '') : null;
 }
 
-function getEffectiveConfig() {
-  const projectId = getCurrentProjectId();
-  const sessionId = getSessionIdByMtime(projectId);
-
+/**
+ * Resolve effective CCR router config following priority: Session > Project > Global.
+ *
+ * @param {string|null} sessionId - From stdin (most reliable) or mtime fallback
+ * @param {string|null} projectId - From encoded cwd
+ * @returns {{ level: 'global'|'project'|'session', config: object }}
+ */
+function getEffectiveConfig(sessionId, projectId) {
   const globalConfig = getCCRConfig();
   let effective = {
     level: 'global',
@@ -113,7 +131,8 @@ function getEffectiveConfig() {
     if (fs.existsSync(projectConfigPath)) {
       try {
         const projectConfig = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
-        if (projectConfig.Router && Object.keys(projectConfig.Router).length > 0) {
+        // Only promote if Router has at least one non-empty value
+        if (projectConfig.Router && Object.values(projectConfig.Router).some(v => v)) {
           effective = { level: 'project', config: projectConfig.Router };
         }
       } catch (e) { /* ignore */ }
@@ -125,7 +144,8 @@ function getEffectiveConfig() {
     if (fs.existsSync(sessionConfigPath)) {
       try {
         const sessionConfig = JSON.parse(fs.readFileSync(sessionConfigPath, 'utf-8'));
-        if (sessionConfig.Router && Object.keys(sessionConfig.Router).length > 0) {
+        // Only promote if Router has at least one non-empty value
+        if (sessionConfig.Router && Object.values(sessionConfig.Router).some(v => v)) {
           effective = { level: 'session', config: sessionConfig.Router };
         }
       } catch (e) { /* ignore */ }
@@ -139,18 +159,22 @@ function modelMatches(modelStr, currentModel) {
   if (!modelStr || !currentModel) return false;
   if (modelStr === currentModel) return true;
 
+  // Handle both "provider/model" and "provider,model" formats
   const parts = modelStr.split(/[/,]/);
   for (const part of parts) {
     if (part.trim() === currentModel) return true;
   }
-  const fullName = parts.length >= 2 ? `${parts[0].trim()}/${parts[1].trim()}` : null;
-  if (fullName === currentModel) return true;
+  if (parts.length >= 2) {
+    const fullName = `${parts[0].trim()}/${parts[1].trim()}`;
+    if (fullName === currentModel) return true;
+  }
 
   return false;
 }
 
 function ccrFormatToDisplay(ccrFormat) {
   if (!ccrFormat) return null;
+  // CCR stores as "provider,model", display as "provider/model"
   return ccrFormat.replace(',', '/');
 }
 
@@ -208,8 +232,16 @@ function main() {
     return;
   }
 
+  // Use session_id from stdin (most accurate), fallback to mtime
+  // Use cwd from stdin for correct project detection in all situations
+  const stdinCwd = stdinData.cwd || null;
+  const projectId = getCurrentProjectId(stdinCwd);
+
+  // stdin session_id is the most reliable source — no process-tree walking needed
+  const sessionId = stdinData.session_id || getSessionIdByMtime(projectId);
+
   const config = getCCRConfig();
-  const effective = getEffectiveConfig();
+  const effective = getEffectiveConfig(sessionId, projectId);
   const router = effective.config;
   const level = effective.level;
 
@@ -221,7 +253,7 @@ function main() {
   if (currentModel) {
     const displayModel = ccrFormatToDisplay(currentModel) || currentModel;
 
-    // Find provider info
+    // Find provider info for friendly display
     let providerInfo = null;
     for (const provider of (config?.Providers || [])) {
       for (const model of (provider.models || [])) {
@@ -238,7 +270,7 @@ function main() {
       ? `${providerInfo.name}/${providerInfo.model}`
       : displayModel;
 
-    // Roles
+    // Show non-default roles that differ from default
     const roles = [];
     if (modelMatches(router.think, currentModel)) roles.push('Think');
     if (modelMatches(router.longContext, currentModel)) roles.push('LongCtx');
@@ -253,7 +285,7 @@ function main() {
     modelDisplay = 'CCR (no model)';
   }
 
-  // Level indicator
+  // Level indicator: 🌐 global / 📁 project / 💬 session
   const levelIcons = { global: '\u{1F310}', project: '\u{1F4C1}', session: '\u{1F4AC}' };
   const levelIcon = levelIcons[level] || '';
 
