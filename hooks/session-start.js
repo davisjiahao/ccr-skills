@@ -190,7 +190,74 @@ function buildModelContext(hookInput) {
   const levelLabels = { global: '全局', project: '项目', session: '会话' };
   const levelLabel = levelLabels[level] || level;
 
-  return `当前会话通过 CCR 路由，使用模型: ${displayModel}（${levelLabel}级配置）`;
+  return { displayModel, levelLabel, level };
+}
+
+/**
+ * 计算字符串的显示宽度（中文字符占2个宽度，其他占1个）
+ */
+function getDisplayWidth(str) {
+  // eslint-disable-next-line no-control-regex
+  return [...str].reduce((w, ch) => w + (ch.charCodeAt(0) > 127 ? 2 : 1), 0);
+}
+
+/**
+ * 按显示宽度填充空格（用于中英文混排对齐）
+ */
+function padByWidth(str, targetWidth) {
+  const currentWidth = getDisplayWidth(str);
+  const padding = Math.max(0, targetWidth - currentWidth);
+  return str + ' '.repeat(padding);
+}
+
+/**
+ * 构建包含横幅的上下文文本，用于 additionalContext 注入
+ */
+function buildContextWithBanner(modelInfo) {
+  if (!modelInfo) return null;
+
+  const { displayModel, levelLabel } = modelInfo;
+
+  // 边框内部总宽度
+  const innerWidth = 56;
+  const labelWidth = 8;
+  const valueWidth = innerWidth - labelWidth;
+
+  // 构建横幅文本
+  const lines = [
+    '',
+    '╔════════════════════════════════════════════════════════╗',
+    '║              🚀 CCR Model Active                       ║',
+    '╠════════════════════════════════════════════════════════╣',
+    `║  模型: ${padByWidth(displayModel, valueWidth)}║`,
+    `║  级别: ${padByWidth(levelLabel, valueWidth)}║`,
+    '╚════════════════════════════════════════════════════════╝',
+    ''
+  ];
+
+  return lines.join('\n');
+}
+
+/**
+ * 通过 macOS 通知中心显示横幅通知
+ */
+function showMacNotification(modelInfo) {
+  if (!modelInfo || process.platform !== 'darwin') return;
+
+  const { displayModel, levelLabel } = modelInfo;
+  const title = '🚀 CCR Model Active';
+  const message = `模型: ${displayModel}\n级别: ${levelLabel}`;
+
+  try {
+    // 使用 osascript 显示通知
+    const script = `display notification "${message}" with title "${title}"`;
+    require('child_process').execSync(`osascript -e '${script}'`, {
+      stdio: 'ignore',
+      timeout: 2000
+    });
+  } catch (e) {
+    // 通知失败不影响 hook 执行
+  }
 }
 
 // ============ Main ============
@@ -200,15 +267,24 @@ const hookInput = readHookInput();
 // Step 1: cache session ID (side effect, must happen before any output)
 cacheSessionId(hookInput);
 
-// Step 2: inject CCR model info into Claude's context via additionalContext
-const modelContext = buildModelContext(hookInput);
+// Step 2: build model info and generate context with banner
+const modelInfo = buildModelContext(hookInput);
 
-if (modelContext) {
+if (modelInfo) {
+  // 构建包含横幅的上下文文本
+  const contextText = buildContextWithBanner(modelInfo);
+
+  // 显示 macOS 通知
+  showMacNotification(modelInfo);
+
+  // 打印横幅到 stderr（作为备用）
+  process.stderr.write(contextText + '\n');
+
   // Output structured JSON — Claude Code injects additionalContext into the session
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
-      additionalContext: modelContext
+      additionalContext: contextText
     }
   }));
 }
